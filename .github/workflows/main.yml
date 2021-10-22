@@ -25,6 +25,14 @@ jobs:
       # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
       - uses: actions/checkout@v2
 
-      - name: Log in to registry
-        # This is where you will update the PAT to GITHUB_TOKEN
+      - name: Log in to Github Container Registry
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+      - name: Build Docker image
+        run: |
+          docker build . --tag ghcr.io/Paramdigma/compute.rhino3d:latest
+      - name: Run Docker image
+        run: |
+          docker run ghcr.io/Paramdigma/compute.rhino3d:latest
+      - name: Push Docker image
+        run: |
+          docker push ghcr.io/Paramdigma/compute.rhino3d:latest
