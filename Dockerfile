@@ -3,6 +3,7 @@
 # see https://discourse.mcneel.com/t/docker-support/89322 for troubleshooting
 
 # NOTE: use 'process' isolation to build image (otherwise rhino fails to install)
+LABEL org.opencontainers.image.source="https://github.com/paramdigma/compute.rhino3d"
 
 ### builder image
 FROM mcr.microsoft.com/dotnet/sdk:5.0 as builder
