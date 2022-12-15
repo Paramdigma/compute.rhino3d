@@ -14,7 +14,7 @@ RUN dotnet build -c Release src/compute.sln
 ### main image
 # tag must match windows host for build (and run, if running with process isolation)
 # e.g. 1903 for Windows 10 version 1903 host
-FROM mcr.microsoft.com/windows:1903
+FROM mcr.microsoft.com/windows/server:ltsc2022
 
 # install rhino (with “-package -quiet” args)
 # NOTE: edit this if you use a different version of rhino!
