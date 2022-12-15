@@ -12,7 +12,7 @@ __all__ = (
     "HopsBoolean",
     # "HopsBox",
     "HopsBrep",
-    # "HopsCircle",
+    "HopsCircle",
     # "HopsColour",
     # "HopsComplex"
     # "HopsCulture",
@@ -28,7 +28,7 @@ __all__ = (
     "HopsMesh",
     # "HopsMeshFace",
     "HopsNumber",
-    # "HopsPlane",
+    "HopsPlane",
     "HopsPoint",
     # "HopsRectangle",
     "HopsString",
@@ -193,6 +193,22 @@ class _GHParam:
 
     def from_result(self, value):
         """Serialize parameter with given value for output"""
+        if self.access == HopsParamAccess.TREE and isinstance(value, dict):
+            tree = {}
+            for key in value.keys():
+                branch_data = [
+                    {
+                        "type": self.result_type,
+                        "data": RHINO_TOJSON(v)
+                    } for v in value[key]
+                ]
+                tree[key] = branch_data
+            output = {
+                "ParamName": self.name,
+                "InnerTree": tree,
+            }
+            return output
+        
         if not isinstance(value, tuple) and not isinstance(value, list):
             value = (value,)
 
@@ -226,6 +242,29 @@ class HopsBrep(_GHParam):
 
     param_type = "Brep"
     result_type = "Rhino.Geometry.Brep"
+
+
+class HopsCircle(_GHParam):
+    """Wrapper for GH_Circle"""
+
+    param_type = "Circle"
+    result_type = "Rhino.Geometry.Circle"
+
+    coercers = {
+        "Rhino.Geometry.Circle": lambda d: HopsCircle._make_circle(
+            HopsPlane._make_plane(d["Plane"]["Origin"],
+                                  d["Plane"]["XAxis"],
+                                  d["Plane"]["YAxis"]),
+            d["Radius"]
+        )
+    }
+
+    @staticmethod
+    def _make_circle(p, r):
+        circle = RHINO_GEOM.Circle(r)
+        circle.Plane = p
+        return circle
+
 
 
 class HopsCurve(_GHParam):
@@ -277,6 +316,25 @@ class HopsNumber(_GHParam):
     coercers = {
         "System.Double": lambda d: float(d),
     }
+
+
+class HopsPlane(_GHParam):
+    """Wrapper for GH_Plane"""
+
+    param_type ="Plane"
+    result_type = "Rhino.Geometry.Plane"
+
+    coercers = {
+        "Rhino.Geometry.Plane": lambda p: HopsPlane._make_plane(p["Origin"],
+                                                                p["XAxis"],
+                                                                p["YAxis"])
+    }
+
+    @staticmethod
+    def _make_plane(o, x, y):
+        return RHINO_GEOM.Plane(RHINO_GEOM.Point3d(o["X"], o["Y"], o["Z"]),
+                                RHINO_GEOM.Vector3d(x["X"], x["Y"], x["Z"]),
+                                RHINO_GEOM.Vector3d(y["X"], y["Y"], y["Z"]))
 
 
 class HopsPoint(_GHParam):

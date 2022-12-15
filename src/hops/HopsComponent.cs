@@ -11,6 +11,8 @@ using Resthopper.IO;
 using Newtonsoft.Json;
 using Rhino.Geometry;
 using System.Threading.Tasks;
+using System.IO;
+using Rhino;
 
 namespace Hops
 {
@@ -28,6 +30,7 @@ namespace Hops
         bool _showEnabledInput = false;
         bool _enabledThisSolve = true;
         bool _showPathInput = false;
+        int _iteration = 0;
 
         SolveDataList _workingSolveList;
         int _solveSerialNumber = 0;
@@ -62,7 +65,7 @@ namespace Hops
 
         protected override string HtmlHelp_Source()
         {
-            return "GOTO:https://developer.rhino3d.com/guides/grasshopper/hops-component/";
+            return "GOTO:https://developer.rhino3d.com/guides/compute/hops-component/";
         }
 
         protected override void RegisterInputParams(GH_InputParamManager pManager)
@@ -81,10 +84,11 @@ namespace Hops
             _enabledThisSolve = true;
             _lastCreatedSchema = null;
             _solveRecursionLevel = 0;
-            if (_isHeadless)
+            var doc = OnPingDocument();
+
+            if (_isHeadless && doc != null)
             {
-                // compute will set the ComputeRecursionLevel
-                var doc = OnPingDocument();
+                // compute will set the ComputeRecursionLevel 
                 _solveRecursionLevel = doc.ConstantServer["ComputeRecursionLevel"]._Int;
             }
 
@@ -95,6 +99,7 @@ namespace Hops
                     _workingSolveList.Canceled = true;
                 _workingSolveList = new SolveDataList(_solveSerialNumber, this, _remoteDefinition, _cacheResultsInMemory);
             }
+
             base.BeforeSolveInstance();
         }
 
@@ -111,10 +116,22 @@ namespace Hops
 
         public int SolveSerialNumber => _solveSerialNumber;
 
+        HTTPRecord _httpRecord;
+        public HTTPRecord HTTPRecord
+        {
+            get
+            {
+                if (_httpRecord == null)
+                    _httpRecord = new HTTPRecord();
+                return _httpRecord; 
+            }
+        }
+
         protected override void SolveInstance(IGH_DataAccess DA)
         {
             if (!_enabledThisSolve)
                 return;
+            _iteration++;
 
             // Limit recursive calls on compute
             if (_isHeadless && _solveRecursionLevel > HopsAppSettings.RecursionLimit)
@@ -142,7 +159,7 @@ namespace Hops
                 }
             }
 
-            if ( string.IsNullOrWhiteSpace(RemoteDefinitionLocation))
+            if (string.IsNullOrWhiteSpace(RemoteDefinitionLocation)  && _remoteDefinition?.InternalizedDefinition == null)
             {
                 AddRuntimeMessage(GH_RuntimeMessageLevel.Warning, "No URL or path defined for definition");
                 return;
@@ -160,7 +177,7 @@ namespace Hops
 
             if (InPreSolve)
             {
-                if(_workingSolveList.SolvedFor(_solveSerialNumber))
+                if (_workingSolveList.SolvedFor(_solveSerialNumber))
                 {
                     var solvedTask = Task.FromResult(_workingSolveList.SolvedSchema(DA.Iteration));
                     TaskList.Add(solvedTask);
@@ -168,12 +185,21 @@ namespace Hops
                 }
 
                 List<string> warnings;
-                var inputSchema = _remoteDefinition.CreateSolveInput(DA, _cacheResultsOnServer, _solveRecursionLevel, out warnings);
+                List<string> errors;
+                var inputSchema = _remoteDefinition.CreateSolveInput(DA, _cacheResultsOnServer, _solveRecursionLevel, out warnings, out errors);
                 if (warnings != null && warnings.Count > 0)
                 {
                     foreach (var warning in warnings)
                     {
                         AddRuntimeMessage(GH_RuntimeMessageLevel.Warning, warning);
+                    }
+                    return;
+                }
+                if (errors != null && errors.Count > 0)
+                {
+                    foreach (var error in errors)
+                    {
+                        AddRuntimeMessage(GH_RuntimeMessageLevel.Error, error);
                     }
                     return;
                 }
@@ -206,13 +232,22 @@ namespace Hops
 
             if (!GetSolveResults(DA, out var schema))
             {
+                List<string> errors;
                 List<string> warnings;
-                var inputSchema = _remoteDefinition.CreateSolveInput(DA, _cacheResultsOnServer, _solveRecursionLevel, out warnings);
+                var inputSchema = _remoteDefinition.CreateSolveInput(DA, _cacheResultsOnServer, _solveRecursionLevel, out warnings, out errors);
                 if (warnings != null && warnings.Count > 0)
                 {
                     foreach (var warning in warnings)
                     {
                         AddRuntimeMessage(GH_RuntimeMessageLevel.Warning, warning);
+                    }
+                    return;
+                }
+                if (errors != null && errors.Count > 0)
+                {
+                    foreach (var error in errors)
+                    {
+                        AddRuntimeMessage(GH_RuntimeMessageLevel.Error, error);
                     }
                     return;
                 }
@@ -247,6 +282,8 @@ namespace Hops
         const string TagSynchronousSolve = "SynchronousSolve";
         const string TagShowEnabled = "ShowInput_Enabled";
         const string TagShowPath = "ShowInput_Path";
+        const string TagInternalizeDefinitionFlag = "InternalizeFlag";
+        const string TagInternalizeDefinition = "InternalizeDefinition";
 
         public override bool Write(GH_IWriter writer)
         {
@@ -260,6 +297,10 @@ namespace Hops
                 writer.SetBoolean(TagSynchronousSolve, _synchronous);
                 writer.SetBoolean(TagShowEnabled, _showEnabledInput);
                 writer.SetBoolean(TagShowPath, _showPathInput);
+                if(_remoteDefinition?.InternalizedDefinition != null)
+                {
+                    writer.SetByteArray(TagInternalizeDefinition, _remoteDefinition.InternalizedDefinition);
+                }
             }
             return rc;
         }
@@ -293,16 +334,53 @@ namespace Hops
                 if (reader.TryGetBoolean(TagShowPath, ref showPath))
                     _showPathInput = showPath;
 
+                if(reader.ItemExists(TagInternalizeDefinition))
+                {
+                    try
+                    {
+                        byte[] internalizedDefinition = reader.GetByteArray(TagInternalizeDefinition);
+                        if(_remoteDefinition == null)
+                            _remoteDefinition = RemoteDefinition.Create(null, this);
+                        _remoteDefinition.InternalizedDefinition = internalizedDefinition;
+                        _remoteDefinition._pathType = RemoteDefinition.PathType.InternalizedDefinition;
+                        _remoteDefinition.GetRemoteDescription();
+                    }
+                    catch(Exception ex)
+                    {
+                        AddRuntimeMessage(GH_RuntimeMessageLevel.Error, "Unable to deserialize internalized grasshopper definition. " + ex.Message);
+                    }
+                }
+
+
                 // set remote definition location last as it will need all of the
                 // previous values to define inputs and outputs
-                try
+                if (!String.IsNullOrWhiteSpace(path))
                 {
-                    RemoteDefinitionLocation = path;
-                }
-                catch (System.Net.WebException)
-                {
-                    // this can happen if a server is not responding and is acceptable in this
-                    // case as we want to read without throwing exceptions
+                    try
+                    {
+                        var pathType = RemoteDefinition.GetPathType(path);
+                        if (pathType == RemoteDefinition.PathType.GrasshopperDefinition)
+                        {
+                            if (!File.Exists(path))
+                            {
+                                // See if the file is in the same directoy as this definition. If it
+                                // is then use that file. NOTE: This will change the saved path for
+                                // for this component when we save the GH definition again. That may or
+                                // may not be a problem; I'm not sure yet.
+                                string parentDirectory = Path.GetDirectoryName(reader.ArchiveLocation);
+                                string remoteFileName = Path.GetFileName(path);
+                                string filePath = Path.Combine(parentDirectory, remoteFileName);
+                                if (File.Exists(filePath))
+                                    path = filePath;
+                            }
+                        }
+                        RemoteDefinitionLocation = path;
+                    }
+                    catch (System.Net.WebException)
+                    {
+                        // this can happen if a server is not responding and is acceptable in this
+                        // case as we want to read without throwing exceptions
+                    }
                 }
             }
             return rc;
@@ -362,12 +440,39 @@ namespace Hops
                     continue;
                 }
             }
+            
+            //remove extra separator from menu
+            var separator = menu.Items[menu.Items.Count - 1] as ToolStripSeparator;
+            if (separator != null)
+                menu.Items.RemoveAt(menu.Items.Count - 1);
+
+            menu.Items.Add(new ToolStripSeparator());
 
             var tsi = new ToolStripMenuItem("&Path...", null, (sender, e) => { ShowSetDefinitionUi(); });
             if (!_showPathInput)
                 tsi.Font = new System.Drawing.Font(tsi.Font, System.Drawing.FontStyle.Bold);
             tsi.Enabled = !_showPathInput;
             menu.Items.Add(tsi);
+
+            tsi = HopsFunctionMgr.AddFunctionMgrControl(this);
+            if (tsi != null)
+                menu.Items.Add(tsi);
+
+            tsi = new ToolStripMenuItem("Internalize Definition", null, (s, e) => {
+                if (File.Exists(RemoteDefinitionLocation))
+                {
+                    _remoteDefinition.InternalizeDefinition(RemoteDefinitionLocation);
+                    DefineInputsAndOutputs();                 
+                }
+            });
+            tsi.ToolTipText = "Make the referenced definition permanent and clear any existing source paths";
+            if (!File.Exists(RemoteDefinitionLocation))
+            {
+                tsi.Enabled = false;
+            }
+            menu.Items.Add(tsi);
+
+            menu.Items.Add(new ToolStripSeparator());
 
             tsi = new ToolStripMenuItem("Show Input: Path", null, (s, e) => {
                 _showPathInput = !_showPathInput;
@@ -406,8 +511,21 @@ namespace Hops
             tsi = new ToolStripMenuItem("Export python sample...", null, (s, e) => { ExportAsPython(); });
             exportTsi.DropDownItems.Add(tsi);
 
-            tsi = new ToolStripMenuItem("Export input as json...", null, (s, e) => { ExportAsJson(); });
-            exportTsi.DropDownItems.Add(tsi);
+            var restAPITsi = new ToolStripMenuItem("REST API");
+            restAPITsi.Enabled = _remoteDefinition != null;
+            exportTsi.DropDownItems.Add(restAPITsi);
+
+            tsi = new ToolStripMenuItem("Last IO request...", null, (s, e) => { ExportLastIORequest(); });
+            restAPITsi.DropDownItems.Add(tsi);
+
+            tsi = new ToolStripMenuItem("Last IO response...", null, (s, e) => { ExportLastIOResponse(); });
+            restAPITsi.DropDownItems.Add(tsi);
+
+            tsi = new ToolStripMenuItem("Last Solve request...", null, (s, e) => { ExportLastSolveRequest(); });
+            restAPITsi.DropDownItems.Add(tsi);
+
+            tsi = new ToolStripMenuItem("Last Solve response...", null, (s, e) => { ExportLastSolveResponse(); });
+            restAPITsi.DropDownItems.Add(tsi);
         }
 
         /// <summary>
@@ -549,23 +667,64 @@ for value in values:
             }
         }
 
-        void ExportAsJson()
+        void ExportLastIORequest()
         {
-            if (_lastCreatedSchema == null)
+            if (String.IsNullOrEmpty(HTTPRecord.IORequest))
             {
-                Eto.Forms.MessageBox.Show("No input created. Run this component at least once", Eto.Forms.MessageBoxType.Error);
+                Eto.Forms.MessageBox.Show("No IO request has been made. Run this component at least once", Eto.Forms.MessageBoxType.Error);
                 return;
             }
-
             var dlg = new Eto.Forms.SaveFileDialog();
             dlg.Filters.Add(new Eto.Forms.FileFilter("JSON file", ".json"));
             if (dlg.ShowDialog(Grasshopper.Instances.EtoDocumentEditor) == Eto.Forms.DialogResult.Ok)
             {
-                var sb = new System.Text.StringBuilder();
-                sb.Append(JsonConvert.SerializeObject(_lastCreatedSchema.Values));
-                System.IO.File.WriteAllText(dlg.FileName, sb.ToString());
+                System.IO.File.WriteAllText(dlg.FileName, HTTPRecord.IORequest);
             }
+        }
 
+        void ExportLastIOResponse()
+        {
+            if (String.IsNullOrEmpty(HTTPRecord.IOResponse))
+            {
+                Eto.Forms.MessageBox.Show("No IO response has been received. Run this component at least once", Eto.Forms.MessageBoxType.Error);
+                return;
+            }
+            var dlg = new Eto.Forms.SaveFileDialog();
+            dlg.Filters.Add(new Eto.Forms.FileFilter("JSON file", ".json"));
+            if (dlg.ShowDialog(Grasshopper.Instances.EtoDocumentEditor) == Eto.Forms.DialogResult.Ok)
+            {
+                System.IO.File.WriteAllText(dlg.FileName, HTTPRecord.IOResponse);
+            }
+        }
+
+        void ExportLastSolveRequest()
+        {
+            if (String.IsNullOrEmpty(HTTPRecord.SolveRequest))
+            {
+                Eto.Forms.MessageBox.Show("No solve request has been made. Run this component at least once", Eto.Forms.MessageBoxType.Error);
+                return;
+            }
+            var dlg = new Eto.Forms.SaveFileDialog();
+            dlg.Filters.Add(new Eto.Forms.FileFilter("JSON file", ".json"));
+            if (dlg.ShowDialog(Grasshopper.Instances.EtoDocumentEditor) == Eto.Forms.DialogResult.Ok)
+            {
+                System.IO.File.WriteAllText(dlg.FileName, HTTPRecord.SolveRequest);
+            }
+        }
+
+        void ExportLastSolveResponse()
+        {
+            if (String.IsNullOrEmpty(HTTPRecord.SolveResponse))
+            {
+                Eto.Forms.MessageBox.Show("No solve response has been received. Run this component at least once", Eto.Forms.MessageBoxType.Error);
+                return;
+            }
+            var dlg = new Eto.Forms.SaveFileDialog();
+            dlg.Filters.Add(new Eto.Forms.FileFilter("JSON file", ".json"));
+            if (dlg.ShowDialog(Grasshopper.Instances.EtoDocumentEditor) == Eto.Forms.DialogResult.Ok)
+            {
+                System.IO.File.WriteAllText(dlg.FileName, HTTPRecord.SolveResponse);
+            }
         }
 
         string _tempPath;
@@ -587,8 +746,6 @@ for value in values:
                 _tempPath = null;
             }
         }
-
-
 
         // keep public in case external C# code wants to set this
         public string RemoteDefinitionLocation
@@ -656,6 +813,22 @@ for value in values:
                     Grasshopper.Instances.ActiveCanvas?.Invalidate();
                     return;
                 }
+                if(HTTPRecord.IOResponseSchema != null && HTTPRecord.IOResponseSchema.Errors.Count > 0)
+                {
+                    foreach(var error in HTTPRecord.IOResponseSchema.Errors)
+                    {
+                        AddRuntimeMessage(GH_RuntimeMessageLevel.Error, error);
+                        Grasshopper.Instances.ActiveCanvas?.Invalidate();
+                        return;
+                    }
+                }
+                if(HTTPRecord.IOResponseSchema != null && HTTPRecord.IOResponseSchema.Warnings.Count > 0)
+                {
+                    foreach (var warning in HTTPRecord.IOResponseSchema.Warnings)
+                    {
+                        AddRuntimeMessage(GH_RuntimeMessageLevel.Warning, warning);
+                    }
+                }
 
                 if (!string.IsNullOrWhiteSpace(description) && !Description.Equals(description))
                 {
@@ -674,42 +847,51 @@ for value in values:
                     inputSources.Add(param.Name, new List<IGH_Param>(param.Sources));
                 }
 
+                Dictionary<string, List<IGH_Param>> outputRecipients = new Dictionary<string, List<IGH_Param>>();
+                foreach (var param in Params.Output)
+                {
+                    outputRecipients.Add(param.Name, new List<IGH_Param>(param.Recipients));
+                }
+
                 int inputCount = inputs!=null ? inputs.Count : 0;
                 if (_showEnabledInput)
                     inputCount++;
                 if (_showPathInput)
                     inputCount++;
-                if (buildInputs && Params.Input.Count == inputCount)
+     
+                if(_iteration == 0)
                 {
-                    buildInputs = false;
-                    foreach (var param in Params.Input.ToArray())
+                    if (buildInputs && Params.Input.Count == inputCount)
                     {
-                        if (!inputs.ContainsKey(param.Name))
+                        foreach (var param in Params.Input.ToArray())
                         {
-                            buildInputs = true;
-                            break;
+                            if (!inputs.ContainsKey(param.Name))
+                            {
+                                buildInputs = true;
+                                break;
+                            }
+                            else
+                            {
+                                // if input param exists, make sure param access is correct
+                                var (input, _) = inputs[param.Name];
+                                param.Access = RemoteDefinition.AccessFromInput(input);
+                            }
                         }
-                        else
+                    }
+                    if (buildOutputs && Params.Output.Count == outputs.Count)
+                    {
+                        buildOutputs = false;
+                        foreach (var param in Params.Output.ToArray())
                         {
-                            // if input param exists, make sure param access is correct
-                            var (input, _) = inputs[param.Name];
-                            param.Access = RemoteDefinition.AccessFromInput(input);
+                            if (!outputs.ContainsKey(param.Name))
+                            {
+                                buildOutputs = true;
+                                break;
+                            }
                         }
                     }
                 }
-                if (buildOutputs && Params.Output.Count == outputs.Count)
-                {
-                    buildOutputs = false;
-                    foreach (var param in Params.Output.ToArray())
-                    {
-                        if (!outputs.ContainsKey(param.Name))
-                        {
-                            buildOutputs = true;
-                            break;
-                        }
-                    }
-                }
-
+                
                 // Remove all existing inputs and outputs
                 if (buildInputs)
                 {
@@ -927,111 +1109,118 @@ for value in values:
                         string outputDescription = name;
                         if (!string.IsNullOrWhiteSpace(param.Description))
                             outputDescription = param.Description;
+                        int paramIndex = -1;
                         switch (param)
                         {
                             case Grasshopper.Kernel.Parameters.Param_Arc _:
-                                mgr.AddArcParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
+                                paramIndex = mgr.AddArcParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
                                 break;
                             case Grasshopper.Kernel.Parameters.Param_Boolean _:
-                                mgr.AddBooleanParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
+                                paramIndex = mgr.AddBooleanParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
                                 break;
                             case Grasshopper.Kernel.Parameters.Param_Box _:
-                                mgr.AddBoxParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
+                                paramIndex = mgr.AddBoxParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
                                 break;
                             case Grasshopper.Kernel.Parameters.Param_Brep _:
-                                mgr.AddBrepParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
+                                paramIndex = mgr.AddBrepParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
                                 break;
                             case Grasshopper.Kernel.Parameters.Param_Circle _:
-                                mgr.AddCircleParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
+                                paramIndex = mgr.AddCircleParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
                                 break;
                             case Grasshopper.Kernel.Parameters.Param_Colour _:
-                                mgr.AddColourParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
+                                paramIndex = mgr.AddColourParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
                                 break;
                             case Grasshopper.Kernel.Parameters.Param_Complex _:
-                                mgr.AddComplexNumberParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
+                                paramIndex = mgr.AddComplexNumberParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
                                 break;
                             case Grasshopper.Kernel.Parameters.Param_Culture _:
-                                mgr.AddCultureParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
+                                paramIndex = mgr.AddCultureParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
                                 break;
                             case Grasshopper.Kernel.Parameters.Param_Curve _:
-                                mgr.AddCurveParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
+                                paramIndex = mgr.AddCurveParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
                                 break;
                             case Grasshopper.Kernel.Parameters.Param_Field _:
-                                mgr.AddFieldParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
+                                paramIndex = mgr.AddFieldParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
                                 break;
                             case Grasshopper.Kernel.Parameters.Param_FilePath _:
-                                mgr.AddTextParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
+                                paramIndex = mgr.AddTextParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
                                 break;
                             case Grasshopper.Kernel.Parameters.Param_GenericObject _:
-                                mgr.AddGenericParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
+                                paramIndex = mgr.AddGenericParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
                                 break;
                             case Grasshopper.Kernel.Parameters.Param_Geometry _:
-                                mgr.AddGeometryParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
+                                paramIndex = mgr.AddGeometryParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
                                 break;
                             case Grasshopper.Kernel.Parameters.Param_Group _:
                                 throw new Exception("group param not supported");
                             case Grasshopper.Kernel.Parameters.Param_Guid _:
                                 throw new Exception("guid param not supported");
                             case Grasshopper.Kernel.Parameters.Param_Integer _:
-                                mgr.AddIntegerParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
+                                paramIndex = mgr.AddIntegerParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
                                 break;
                             case Grasshopper.Kernel.Parameters.Param_Interval _:
-                                mgr.AddIntervalParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
+                                paramIndex = mgr.AddIntervalParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
                                 break;
                             case Grasshopper.Kernel.Parameters.Param_Interval2D _:
-                                mgr.AddInterval2DParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
+                                paramIndex = mgr.AddInterval2DParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
                                 break;
                             case Grasshopper.Kernel.Parameters.Param_LatLonLocation _:
                                 throw new Exception("latlonlocation param not supported");
                             case Grasshopper.Kernel.Parameters.Param_Line _:
-                                mgr.AddLineParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
+                                paramIndex = mgr.AddLineParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
                                 break;
                             case Grasshopper.Kernel.Parameters.Param_Matrix _:
-                                mgr.AddMatrixParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
+                                paramIndex = mgr.AddMatrixParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
                                 break;
                             case Grasshopper.Kernel.Parameters.Param_Mesh _:
-                                mgr.AddMeshParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
+                                paramIndex = mgr.AddMeshParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
                                 break;
                             case Grasshopper.Kernel.Parameters.Param_MeshFace _:
-                                mgr.AddMeshFaceParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
+                                paramIndex = mgr.AddMeshFaceParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
                                 break;
                             case Grasshopper.Kernel.Parameters.Param_MeshParameters _:
-                                throw new Exception("meshparameters paran not supported");
+                                throw new Exception("meshparameters param not supported");
                             case Grasshopper.Kernel.Parameters.Param_Number _:
-                                mgr.AddNumberParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
+                                paramIndex = mgr.AddNumberParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
                                 break;
                             //case Grasshopper.Kernel.Parameters.Param_OGLShader:
                             case Grasshopper.Kernel.Parameters.Param_Plane _:
-                                mgr.AddPlaneParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
+                                paramIndex = mgr.AddPlaneParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
                                 break;
                             case Grasshopper.Kernel.Parameters.Param_Point _:
-                                mgr.AddPointParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
+                                paramIndex = mgr.AddPointParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
                                 break;
                             case Grasshopper.Kernel.Parameters.Param_Rectangle _:
-                                mgr.AddRectangleParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
+                                paramIndex = mgr.AddRectangleParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
                                 break;
                             //case Grasshopper.Kernel.Parameters.Param_ScriptVariable _:
                             case Grasshopper.Kernel.Parameters.Param_String _:
-                                mgr.AddTextParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
+                                paramIndex = mgr.AddTextParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
                                 break;
                             case Grasshopper.Kernel.Parameters.Param_StructurePath _:
-                                mgr.AddPathParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
+                                paramIndex = mgr.AddPathParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
                                 break;
                             case Grasshopper.Kernel.Parameters.Param_SubD _:
-                                mgr.AddSubDParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
+                                paramIndex = mgr.AddSubDParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
                                 break;
                             case Grasshopper.Kernel.Parameters.Param_Surface _:
-                                mgr.AddSurfaceParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
+                                paramIndex = mgr.AddSurfaceParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
                                 break;
                             case Grasshopper.Kernel.Parameters.Param_Time _:
-                                mgr.AddTimeParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
+                                paramIndex = mgr.AddTimeParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
                                 break;
                             case Grasshopper.Kernel.Parameters.Param_Transform _:
-                                mgr.AddTransformParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
+                                paramIndex = mgr.AddTransformParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
                                 break;
                             case Grasshopper.Kernel.Parameters.Param_Vector _:
-                                mgr.AddVectorParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
+                                paramIndex = mgr.AddVectorParameter(name, nickname, outputDescription, GH_ParamAccess.tree);
                                 break;
+                        }
+
+                        if (paramIndex >= 0 && outputRecipients.TryGetValue(name, out List<IGH_Param> rehookOutputs))
+                        {
+                            foreach (var rehookOutput in rehookOutputs)
+                                rehookOutput.AddSource(Params.Output[paramIndex]); 
                         }
                     }
                 }
